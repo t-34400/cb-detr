@@ -171,12 +171,17 @@ class CuboidDataset(Dataset):
 
         if "uv" in ann:
             uv = torch.from_numpy(ann["uv"]).float()
-            # if looks normalized, keep; else scale
-            maxv = float(uv.abs().max())
-            if maxv > 1.5:
-                uv[:, 0] *= s
-                uv[:, 1] *= s
-            ann["uv"] = uv
+
+            if uv.numel() == 0:
+                ann["uv"] = uv
+            
+            else:
+                # if looks normalized, keep; else scale
+                maxv = float(uv.abs().max())
+                if maxv > 1.5:
+                    uv[:, 0] *= s
+                    uv[:, 1] *= s
+                ann["uv"] = uv
 
         if "edge_len_px" in ann:
             v = torch.from_numpy(ann["edge_len_px"]).float()
