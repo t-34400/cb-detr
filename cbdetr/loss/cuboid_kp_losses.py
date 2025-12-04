@@ -169,6 +169,7 @@ def cuboid_kp_losses(outputs, targets, kp_match_results,
                      lambda_kp=4.0, lambda_bbox_kp=1.0,
                      lambda_edge=0.5,
                      lambda_face=0.3, lambda_rep=0.05,
+                     lambda_kp_coarse=1.0, lambda_edge_coarse=0.2,
                      use_huber=True,
                      coord_scale=1.0):
 
@@ -188,6 +189,9 @@ def cuboid_kp_losses(outputs, targets, kp_match_results,
     loss_face_all = []
     loss_rep_all = []
 
+    loss_kp_coarse = []
+    loss_edge_coarse = []
+
     for b, mr in enumerate(kp_match_results):
         pred_idx = mr["pred_idx"]
         tgt_idx = mr["tgt_idx"]
@@ -200,7 +204,7 @@ def cuboid_kp_losses(outputs, targets, kp_match_results,
         Tb = targets[b]["boxes"][tgt_idx].to(device)      # (M,4), same coords
 
         # Core regression (image-normalized coords + scale factor)
-        l_kp = loss_kp_core(Pk, Tk, use_huber=use_huber, delta=0.05,
+        l_kp = loss_kp_core(Pk, Tk, use_huber=use_huber, delta=0.02,
                              coord_scale=coord_scale)                # (M,)
         # BBox consistency
         l_bboxkp = loss_bbox_from_kp_consistency(Pb, Pk)             # (M,)
@@ -216,6 +220,14 @@ def cuboid_kp_losses(outputs, targets, kp_match_results,
         loss_face_all.append(l_face)
         loss_rep_all.append(l_rep)
 
+        if "pred_kp_coarse" in outputs:
+            Pk_coarse = outputs["pred_kp_coarse"][b, pred_idx]      # (M,8,2)
+            l_kp_c = loss_kp_core(Pk_coarse, Tk, use_huber=use_huber,
+                                  delta=0.02, coord_scale=coord_scale)  # (M,)
+            l_edge_c = loss_edges(Pk_coarse, Tk)                    # (M,)
+            loss_kp_coarse.append(l_kp_c)
+            loss_edge_coarse.append(l_edge_c)
+
     def _cat_mean(xs):
         if len(xs) == 0:
             return torch.tensor(0.0, device=device)
@@ -227,13 +239,17 @@ def cuboid_kp_losses(outputs, targets, kp_match_results,
         "loss_edge":    _cat_mean(loss_edge_all),
         "loss_face":    _cat_mean(loss_face_all),
         "loss_rep":     _cat_mean(loss_rep_all),
+        "loss_kp_coarse": _cat_mean(loss_kp_coarse),
+        "loss_edge_coarse": _cat_mean(loss_edge_coarse),
     }
 
     total = (lambda_kp      * losses["loss_kp"]
            + lambda_bbox_kp * losses["loss_bbox_kp"]
            + lambda_edge    * losses["loss_edge"]
            + lambda_face    * losses["loss_face"]
-           + lambda_rep     * losses["loss_rep"])
+           + lambda_rep     * losses["loss_rep"]
+           + lambda_kp_coarse * losses["loss_kp_coarse"]
+           + lambda_edge_coarse * losses["loss_edge_coarse"])
 
     losses["loss_kp_total"] = total
     return losses

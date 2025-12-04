@@ -173,6 +173,8 @@ def build_model(args: ModelArgs, transformer_args: TransformerArgs):
         transformer=transformer,
         num_queries=transformer.num_queries,
         group_detr=transformer_args.group_detr,
+        kp_feat_dim=128,
+        kp_upsample_factor=2.0,
         aux_loss=args.aux_loss,
         lite_refpoint_refine=transformer_args.lite_refpoint_refine,
         bbox_reparam=transformer_args.bbox_reparam

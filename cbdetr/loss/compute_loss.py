@@ -57,6 +57,8 @@ def compute_total_loss(
     lambda_edge: float = 0.5,
     lambda_face: float = 0.3,
     lambda_rep: float = 0.05,
+    lambda_kp_coarse: float = 1.0,
+    lambda_edge_coarse: float = 0.2,
     use_huber: bool = True,
     # DETR-style: also train on intermediate decoder layers if present
     use_aux_losses: bool = True,
@@ -119,6 +121,8 @@ def compute_total_loss(
         lambda_edge=lambda_edge,
         lambda_face=lambda_face,
         lambda_rep=lambda_rep,
+        lambda_kp_coarse=lambda_kp_coarse,
+        lambda_edge_coarse=lambda_edge_coarse,
         use_huber=use_huber
     )
 
@@ -185,6 +189,8 @@ def compute_total_loss(
                 lambda_edge=lambda_edge,
                 lambda_face=lambda_face,
                 lambda_rep=lambda_rep,
+                lambda_kp_coarse=lambda_kp_coarse,
+                lambda_edge_coarse=lambda_edge_coarse,
                 use_huber=use_huber
             )
 

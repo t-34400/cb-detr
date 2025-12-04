@@ -1,16 +1,17 @@
 # ------------------------------------------------------------------------
-# RF-DETR
-# Copyright (c) 2025 Roboflow. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
-# Modified from LW-DETR (https://github.com/Atten4Vis/LW-DETR)
-# Copyright (c) 2024 Baidu. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from Conditional DETR (https://github.com/Atten4Vis/ConditionalDETR)
-# Copyright (c) 2021 Microsoft. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Copied from DETR (https://github.com/facebookresearch/detr)
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+# Cuboid-DETR
+# Copyright (c) 2025 t-34400
+# Licensed under the Apache License, Version 2.0 (see LICENSE for details)
+#
+# Based on:
+#  - RF-DETR, Copyright (c) 2025 Roboflow
+#    Licensed under the Apache License, Version 2.0
+#  - LW-DETR, Copyright (c) 2024 Baidu
+#    Licensed under the Apache License, Version 2.0
+#  - Conditional DETR, Copyright (c) 2021 Microsoft
+#    Licensed under the Apache License, Version 2.0
+#  - DETR, Copyright (c) Facebook, Inc. and its affiliates
+#    Licensed under the Apache License, Version 2.0
 # ------------------------------------------------------------------------
 
 """
@@ -106,7 +107,13 @@ class Backbone(BackboneBase):
             rms_norm=rms_norm,
         )
 
+        self._last_encoder_feats = None
+
         self._export = False
+
+    @property
+    def last_encoder_feats(self):
+        return self._last_encoder_feats
 
     def export(self):
         self._export = True
@@ -118,24 +125,26 @@ class Backbone(BackboneBase):
             self.encoder.merge_and_unload()
 
     def forward(self, tensor_list: NestedTensor):
-        """ """
         # (H, W, B, C)
-        feats = self.encoder(tensor_list.tensors)
-        feats = self.projector(feats)
+        encoder_feats = self.encoder(tensor_list.tensors)
+        self._last_encoder_feats = encoder_feats
+
+        feats = self.projector(encoder_feats)
         # x: [(B, C, H, W)]
         out = []
         for feat in feats:
             m = tensor_list.mask
             assert m is not None
-            mask = F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[
-                0
-            ]
+            mask = F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
             out.append(NestedTensor(feat, mask))
         return out
 
     def forward_export(self, tensors: torch.Tensor):
-        feats = self.encoder(tensors)
-        feats = self.projector(feats)
+        encoder_feats = self.encoder(tensors)
+        self._last_encoder_feats = encoder_feats
+
+        feats = self.projector(encoder_feats)
+        
         out_feats = []
         out_masks = []
         for feat in feats:

@@ -31,11 +31,12 @@ def hungarian_match_bbox(outputs, targets,
     out_bbox = outputs["pred_boxes"].flatten(0, 1)      # [B*Q_total, 4]
 
     prob = flat_logits.softmax(-1)                      # [B*Q_total, 2]
+    p_obj = prob[:, 1].clamp(min=1e-6, max=1.0 - 1e-6)
 
     tgt_bbox = torch.cat([v["boxes"] for v in targets])
     sizes = [len(v["boxes"]) for v in targets]
 
-    cost_class_mat = -prob[:, 1].log().unsqueeze(1).expand(-1, tgt_bbox.size(0))
+    cost_class_mat = -p_obj.log().unsqueeze(1).expand(-1, tgt_bbox.size(0))
     cost_bbox_mat = torch.cdist(out_bbox, tgt_bbox, p=1)
     giou = generalized_box_iou(
         box_cxcywh_to_xyxy(out_bbox),
