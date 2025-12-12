@@ -1,20 +1,31 @@
 # ------------------------------------------------------------------------
-# Cuboid-DETR
-# Copyright (c) 2025 t-34400. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# Cuboid-DETR (augmented)
 # ------------------------------------------------------------------------
-
 
 import os
 import glob
 import math
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+
+def get_default_faces() -> np.ndarray:
+    return np.array(
+        [
+            [0, 3, 2, 1],
+            [4, 5, 6, 7],
+            [0, 4, 7, 3],
+            [1, 2, 6, 5],
+            [0, 1, 5, 4],
+            [3, 7, 6, 2],
+        ]
+    )
+
 
 class CuboidDataset(Dataset):
     def __init__(
@@ -30,12 +41,15 @@ class CuboidDataset(Dataset):
         faces_key: str = "categories/cuboid_topology/faces",
         img2obj_key: str = "img2obj",
 
-        size_multiple: int | None = None,
-        size_mode: str = "ceil",            # "ceil" | "floor" | "round"
-        interp: str = "bilinear",           # resize interpolation
+        output_size: Optional[Tuple[int, int] | int] = None,
+        resize_interp: str = "bilinear",
 
-        filter: str | None = None,          # None | "bbox_center" | "kp_in_image"
+        augment: bool = False,
+        scale_range: Tuple[float, float] = (0.8, 1.2),
+        random_crop: bool = True,
+        random_hflip: bool = False,
 
+        object_filter: Optional[str] = None,   # None | "bbox_center" | "kp_in_image"
         center_margin: float = 0.0,
     ):
         self.root_dir = root_dir
@@ -46,19 +60,32 @@ class CuboidDataset(Dataset):
         self.extr_key = extr_key
         self.ann_group = ann_group
         self.img2obj_key = img2obj_key
-        self.faces = None
 
-        self.size_multiple = size_multiple
-        self.size_mode = size_mode
-        self.interp = interp
+        # normalize output_size
+        if output_size is None:
+            self.output_size: Optional[Tuple[int, int]] = None
+        elif isinstance(output_size, int):
+            self.output_size = (output_size, output_size)
+        else:
+            self.output_size = (int(output_size[0]), int(output_size[1]))
+
+        self.resize_interp = resize_interp
+
+        self.augment = augment
+        self.scale_range = (float(scale_range[0]), float(scale_range[1]))
+        self.random_crop = random_crop
+        self.random_hflip = random_hflip
 
         self.center_margin = float(center_margin)
 
+        # select filter function
         self.filter = None
-        if filter == "bbox_center":
+        if object_filter == "bbox_center":
             self.filter = self._filter_objects_by_bbox_center
-        elif filter == "kp_in_image":
+        elif object_filter == "kp_in_image":
             self.filter = self._filter_objects_by_kp_in_image
+
+        self.faces: Optional[torch.Tensor] = None
 
         self.h5_paths = sorted(
             glob.glob(os.path.join(root_dir, "**", "*.h5"), recursive=True)
@@ -71,7 +98,7 @@ class CuboidDataset(Dataset):
             with h5py.File(path, "r") as f:
                 if self.img2obj_key not in f:
                     raise KeyError(f"{self.img2obj_key} not found in {path}")
-                img2obj = np.array(f[self.img2obj_key])  # shape=(num_images, 2)
+                img2obj = np.asarray(f[self.img2obj_key])
 
                 if self.image_key not in f:
                     raise KeyError(f"{self.image_key} not found in {path}")
@@ -85,85 +112,103 @@ class CuboidDataset(Dataset):
                     start, count = int(img2obj[img_idx, 0]), int(img2obj[img_idx, 1])
                     if count >= min_objects:
                         self.entries.append((path, img_idx, start, count))
-                
+
                 if self.faces is None:
                     if faces_key in f:
-                        self.faces = torch.from_numpy(f[faces_key][:])
+                        self.faces = torch.from_numpy(np.asarray(f[faces_key]))
                     else:
                         self.faces = torch.from_numpy(get_default_faces())
 
         if not self.entries:
-            raise RuntimeError("No images matched the filtering conditions (e.g., min_objects).")
+            raise RuntimeError(
+                "No images matched the filtering conditions (e.g., min_objects)."
+            )
 
     def __len__(self) -> int:
         return len(self.entries)
 
-    def _read_object_array(self, dset, start: int, end: int):
+    # ---------------------------------------------------------------------
+    # low-level helpers
+    # ---------------------------------------------------------------------
+
+    def _read_object_array(self, dset, start: int, end: int) -> List[np.ndarray]:
         slice_obj = dset[start:end]
-        out = []
+        out: List[np.ndarray] = []
         for v in slice_obj:
             out.append(np.array(v))
         return out
 
-    @staticmethod
-    def _gcd(a: int, b: int) -> int:
-        while b:
-            a, b = b, a % b
-        return a
-
-    def _compute_uniform_scale_to_multiple(self, H: int, W: int) -> Tuple[float, Tuple[int, int]]:
-        """
-        Find uniform scale s so that (s*H, s*W) are multiples of k.
-        s = (k * t) / gcd(H,W), choose integer t by mode wrt s≈1.
-        """
-        k = self.size_multiple
-        if not k or k <= 0:
-            return 1.0, (H, W)
-
-        g = self._gcd(H, W)
-        # base t* so that s≈1 -> t≈g/k
-        base = g / k
-        if self.size_mode == "floor":
-            t = max(1, int(math.floor(base)))
-        elif self.size_mode == "round":
-            t = max(1, int(round(base)))
-        else:
-            t = max(1, int(math.ceil(base)))
-        s = (k * t) / g
-        Hn = int(round(H * s))
-        Wn = int(round(W * s))
-
-        if Hn % k != 0: Hn += (k - (Hn % k))
-        if Wn % k != 0: Wn += (k - (Wn % k))
-        s = Hn / H  # uniform by construction
-        return float(s), (Hn, Wn)
-
-    def _resize_image(self, img_chw: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
-        # img_chw: (3,H,W) float[0..1]
+    def _resize_image(
+        self, img_chw: torch.Tensor, target_hw: Tuple[int, int]
+    ) -> torch.Tensor:
         img_bchw = img_chw.unsqueeze(0)
-        mode = self.interp
-        align_corners = None
-        if mode in ("bilinear", "bicubic"):
-            align_corners = False
+        mode = self.resize_interp
+        align_corners = False if mode in ("bilinear", "bicubic") else None
         out = F.interpolate(img_bchw, size=target_hw, mode=mode, align_corners=align_corners)
         return out.squeeze(0)
 
-    def _scale_intrinsics(self, intr: np.ndarray | torch.Tensor | None, s: float):
+    def _scale_intrinsics(
+        self,
+        intr: Optional[np.ndarray | torch.Tensor],
+        s: float,
+    ) -> Optional[torch.Tensor]:
         if intr is None:
             return None
         K = torch.as_tensor(intr).clone().float()
-
         if K.ndim == 2 and K.shape[0] >= 3 and K.shape[1] >= 3:
-            K[0, 0] *= s  # fx
-            K[1, 1] *= s  # fy
-            K[0, 2] *= s  # cx
-            K[1, 2] *= s  # cy
+            K[0, 0] *= s
+            K[1, 1] *= s
+            K[0, 2] *= s
+            K[1, 2] *= s
         return K
 
-    def _scale_annotations(self, ann: Dict[str, Any], s: float):
-        # scale pixel-domain annotations
+    def _crop_intrinsics(
+        self,
+        K: Optional[torch.Tensor],
+        x0: int,
+        y0: int,
+    ) -> Optional[torch.Tensor]:
+        if K is None:
+            return None
+        K = K.clone()
+        if K.ndim == 2 and K.shape[0] >= 3 and K.shape[1] >= 3:
+            K[0, 2] -= float(x0)
+            K[1, 2] -= float(y0)
+        return K
+
+    def _hflip_intrinsics(
+        self,
+        K: Optional[torch.Tensor],
+        W: int,
+    ) -> Optional[torch.Tensor]:
+        if K is None:
+            return None
+        K = K.clone()
+        if K.ndim == 2 and K.shape[0] >= 3 and K.shape[1] >= 3:
+            cx = K[0, 2]
+            K[0, 2] = (W - 1.0) - cx
+        return K
+
+    def _scale_annotations_uniform(
+        self,
+        ann: Dict[str, Any],
+        s: float,
+    ) -> Dict[str, Any]:
+        if s == 1.0:
+            # still convert some arrays to tensors for convenience
+            if "visible_edges" in ann and isinstance(ann["visible_edges"], np.ndarray):
+                ann["visible_edges"] = torch.from_numpy(ann["visible_edges"]).to(torch.uint8)
+            if "visible_vertices" in ann and isinstance(ann["visible_vertices"], np.ndarray):
+                ann["visible_vertices"] = torch.from_numpy(ann["visible_vertices"]).to(torch.uint8)
+            if "edge_vis_ratio" in ann and isinstance(ann["edge_vis_ratio"], np.ndarray):
+                ann["edge_vis_ratio"] = torch.from_numpy(ann["edge_vis_ratio"]).float()
+            if "vis_ratio" in ann and isinstance(ann["vis_ratio"], np.ndarray):
+                ann["vis_ratio"] = torch.from_numpy(ann["vis_ratio"]).float()
+            if "pnp_cond_score" in ann and isinstance(ann["pnp_cond_score"], np.ndarray):
+                ann["pnp_cond_score"] = torch.from_numpy(ann["pnp_cond_score"]).float()
+            return ann
+
         if "bbox" in ann:
-            # (N,4) [x,y,w,h] in px
             b = torch.from_numpy(ann["bbox"]).float()
             b[:, 0:2] *= s
             b[:, 2:4] *= s
@@ -171,31 +216,25 @@ class CuboidDataset(Dataset):
 
         if "uv" in ann:
             uv = torch.from_numpy(ann["uv"]).float()
-
             if uv.numel() == 0:
                 ann["uv"] = uv
-            
             else:
-                # if looks normalized, keep; else scale
                 maxv = float(uv.abs().max())
-                if maxv > 1.5:
-                    uv[:, 0] *= s
-                    uv[:, 1] *= s
+                if maxv > 1.5:  # pixel coordinates
+                    uv[..., 0] *= s
+                    uv[..., 1] *= s
                 ann["uv"] = uv
 
         if "edge_len_px" in ann:
             v = torch.from_numpy(ann["edge_len_px"]).float()
             ann["edge_len_px"] = v * s
 
-        # pixel areas (best guess)
         if "full_px" in ann:
             v = torch.from_numpy(ann["full_px"]).float()
             ann["full_px"] = v * (s * s)
         if "visible_px" in ann:
             v = torch.from_numpy(ann["visible_px"]).float()
             ann["visible_px"] = v * (s * s)
-
-        # keep ratios/scores as-is
 
         if "visible_edges" in ann:
             ann["visible_edges"] = torch.from_numpy(ann["visible_edges"]).to(torch.uint8)
@@ -210,6 +249,88 @@ class CuboidDataset(Dataset):
 
         return ann
 
+    def _crop_annotations(
+        self,
+        ann: Dict[str, Any],
+        x0: int,
+        y0: int,
+        cropped_hw: Tuple[int, int],
+        img_hw_before: Tuple[int, int],
+    ) -> Dict[str, Any]:
+        H_before, W_before = img_hw_before
+        H_crop, W_crop = cropped_hw
+
+        if "bbox" in ann:
+            b = ann["bbox"]
+            if isinstance(b, np.ndarray):
+                b = torch.from_numpy(b).float()
+            else:
+                b = b.clone().float()
+            b[:, 0] -= float(x0)
+            b[:, 1] -= float(y0)
+            ann["bbox"] = b
+
+        if "uv" in ann:
+            uv = ann["uv"]
+            if isinstance(uv, np.ndarray):
+                uv_t = torch.from_numpy(uv).float()
+            else:
+                uv_t = uv.clone().float()
+
+            if uv_t.numel() > 0:
+                maxv = float(uv_t.abs().max())
+                if maxv <= 1.5:
+                    # uv in [0,1], convert to pixel, apply crop, re-normalize
+                    x_pix = uv_t[..., 0] * float(W_before)
+                    y_pix = uv_t[..., 1] * float(H_before)
+                    x_pix -= float(x0)
+                    y_pix -= float(y0)
+                    uv_t[..., 0] = x_pix / float(W_crop)
+                    uv_t[..., 1] = y_pix / float(H_crop)
+                else:
+                    uv_t[..., 0] -= float(x0)
+                    uv_t[..., 1] -= float(y0)
+            ann["uv"] = uv_t
+
+        return ann
+
+    def _hflip_annotations(
+        self,
+        ann: Dict[str, Any],
+        W: int,
+    ) -> Dict[str, Any]:
+        if "bbox" in ann:
+            b = ann["bbox"]
+            if isinstance(b, np.ndarray):
+                b_t = torch.from_numpy(b).float()
+            else:
+                b_t = b.clone().float()
+            x, y, w, h = b_t.unbind(dim=1)
+            x_new = (W - (x + w))
+            b_t = torch.stack([x_new, y, w, h], dim=1)
+            ann["bbox"] = b_t
+
+        if "uv" in ann:
+            uv = ann["uv"]
+            if isinstance(uv, np.ndarray):
+                uv_t = torch.from_numpy(uv).float()
+            else:
+                uv_t = uv.clone().float()
+
+            if uv_t.numel() > 0:
+                maxv = float(uv_t.abs().max())
+                if maxv <= 1.5:  # normalized
+                    uv_t[..., 0] = 1.0 - uv_t[..., 0]
+                else:  # pixel
+                    uv_t[..., 0] = (W - 1.0) - uv_t[..., 0]
+            ann["uv"] = uv_t
+
+        return ann
+
+    # ---------------------------------------------------------------------
+    # object filters
+    # ---------------------------------------------------------------------
+
     def _filter_objects_by_bbox_center(
         self,
         ann: Dict[str, Any],
@@ -220,8 +341,6 @@ class CuboidDataset(Dataset):
             return ann
 
         b = ann["bbox"]
-
-        # bbox: (N,4) [x, y, w, h] in px
         if isinstance(b, torch.Tensor):
             b_t = b.float()
         elif isinstance(b, np.ndarray):
@@ -245,10 +364,7 @@ class CuboidDataset(Dataset):
         cy = y + 0.5 * h
 
         m = float(self.center_margin)
-
-        valid_center = (cx >= -m) & (cx < float(W) + m) & \
-                       (cy >= -m) & (cy < float(H) + m)
-
+        valid_center = (cx >= -m) & (cx < float(W) + m) & (cy >= -m) & (cy < float(H) + m)
         if valid_center.all():
             return ann
 
@@ -298,7 +414,6 @@ class CuboidDataset(Dataset):
             return ann
 
         if uv_t.ndim == 2 and uv_t.shape[-1] == 2:
-            # (N, 2) → (N, 1, 2)
             uv_t = uv_t.unsqueeze(1)
         elif uv_t.ndim == 3 and uv_t.shape[-1] == 2:
             pass
@@ -316,7 +431,6 @@ class CuboidDataset(Dataset):
             mask_pts = (x >= 0.0) & (x < float(W)) & (y >= 0.0) & (y < float(H))
 
         mask_obj = mask_pts.view(N, -1).all(dim=1)
-
         if mask_obj.all():
             return ann
 
@@ -344,72 +458,202 @@ class CuboidDataset(Dataset):
                 new_ann[k] = v
 
         return new_ann
-    
-    def __getitem__(self, index: int) -> Dict[str, Any]:
-        h5_path, img_idx, start, count = self.entries[index]
-        end = start + count
 
+    # ---------------------------------------------------------------------
+    # augmentation
+    # ---------------------------------------------------------------------
+
+    def _sample_scale(self, H: int, W: int) -> float:
+        s_min, s_max = self.scale_range
+        if not self.augment:
+            return 1.0
+        if s_max <= 0.0:
+            return 1.0
+        if s_min <= 0.0:
+            s_min = 1e-6
+        # use torch.rand so it is on the same RNG stream as other ops
+        r = torch.rand(1).item()
+        return s_min + (s_max - s_min) * r
+
+    def _random_or_center_crop_coords(
+        self,
+        H: int,
+        W: int,
+        out_h: int,
+        out_w: int,
+        random_crop: bool,
+    ) -> Tuple[int, int]:
+        if H <= out_h or W <= out_w:
+            return 0, 0
+        if random_crop:
+            max_y = H - out_h
+            max_x = W - out_w
+            y0 = int(torch.randint(0, max_y + 1, (1,)).item())
+            x0 = int(torch.randint(0, max_x + 1, (1,)).item())
+        else:
+            y0 = (H - out_h) // 2
+            x0 = (W - out_w) // 2
+        return y0, x0
+
+    def _apply_geometric_transforms(
+        self,
+        img: torch.Tensor,
+        intr: Optional[np.ndarray | torch.Tensor],
+        ann: Dict[str, Any],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+        _, H0, W0 = img.shape
+        out_hw = self.output_size
+
+        # 1) scaling
+        if self.augment:
+            s = self._sample_scale(H0, W0)
+        else:
+            # deterministic scale so that shorter side >= output_size (if given)
+            if out_hw is None:
+                s = 1.0
+            else:
+                out_h, out_w = out_hw
+                s_h = out_h / H0
+                s_w = out_w / W0
+                s = max(s_h, s_w, 1e-6)
+
+        H1 = int(round(H0 * s))
+        W1 = int(round(W0 * s))
+        if H1 <= 0:
+            H1 = 1
+        if W1 <= 0:
+            W1 = 1
+
+        if s != 1.0:
+            img = self._resize_image(img, (H1, W1))
+        else:
+            H1, W1 = H0, W0
+
+        K = self._scale_intrinsics(intr, s) if self.include_intrinsics else None
+        ann = self._scale_annotations_uniform(ann, s)
+
+        # 2) crop to output size (if requested)
+        if out_hw is not None:
+            out_h, out_w = out_hw
+            # if scaled image smaller than target, fallback to top-left crop
+            if H1 < out_h or W1 < out_w:
+                y0, x0 = 0, 0
+                out_h_eff = min(out_h, H1)
+                out_w_eff = min(out_w, W1)
+            else:
+                y0, x0 = self._random_or_center_crop_coords(
+                    H1, W1, out_h, out_w, self.random_crop if self.augment else False
+                )
+                out_h_eff, out_w_eff = out_h, out_w
+
+            img = img[:, y0 : y0 + out_h_eff, x0 : x0 + out_w_eff]
+            H2, W2 = img.shape[1], img.shape[2]
+
+            K = self._crop_intrinsics(K, x0, y0)
+            ann = self._crop_annotations(ann, x0, y0, (H2, W2), (H1, W1))
+
+            # if we had to crop smaller than requested (image too small), pad
+            if (H2, W2) != (out_h, out_w):
+                pad_bottom = out_h - H2
+                pad_right = out_w - W2
+                pad_bottom = max(pad_bottom, 0)
+                pad_right = max(pad_right, 0)
+                # pad: (left, right, top, bottom)
+                img = F.pad(img, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
+                # padding adds black border; intrinsics shift is already correct
+                # annotations remain in the same coordinates
+        else:
+            out_h, out_w = H1, W1
+
+        # 3) horizontal flip
+        if self.augment and self.random_hflip:
+            if torch.rand(1).item() < 0.5:
+                img = torch.flip(img, dims=[2])
+                K = self._hflip_intrinsics(K, out_w)
+                ann = self._hflip_annotations(ann, out_w)
+
+        return img, K, ann
+
+    # ---------------------------------------------------------------------
+    # IO
+    # ---------------------------------------------------------------------
+
+    def _load_raw_sample(
+        self, h5_path: str, img_idx: int, start: int, end: int
+    ) -> Tuple[torch.Tensor, Optional[np.ndarray], Optional[np.ndarray], Dict[str, Any], Tuple[int, int]]:
         with h5py.File(h5_path, "r") as f:
-            img = f[self.image_key][img_idx]  # (H, W, 3), uint8
-            H, W = int(img.shape[0]), int(img.shape[1])
-
-            intr = f[self.intr_key][img_idx] if self.include_intrinsics and self.intr_key in f else None
-            extr = f[self.extr_key][img_idx] if self.include_extrinsics and self.extr_key in f else None
+            img_np = np.asarray(f[self.image_key][img_idx])
+            intr = (
+                np.asarray(f[self.intr_key][img_idx])
+                if self.include_intrinsics and self.intr_key in f
+                else None
+            )
+            extr = (
+                np.asarray(f[self.extr_key][img_idx])
+                if self.include_extrinsics and self.extr_key in f
+                else None
+            )
 
             ann_grp = f[self.ann_group]
-            ann = {}
+            ann: Dict[str, Any] = {}
             for key in ann_grp.keys():
                 dset = ann_grp[key]
                 if dset.dtype.kind == "O":
                     ann[key] = self._read_object_array(dset, start, end)
                 else:
-                    ann[key] = dset[start:end]
+                    ann[key] = np.asarray(dset[start:end])
 
-            img = torch.from_numpy(img).permute(2, 0, 1).contiguous().float() / 255.0  # (3,H,W)
+        img = torch.from_numpy(img_np).permute(2, 0, 1).contiguous().float() / 255.0
+        H, W = img.shape[1], img.shape[2]
+        return img, intr, extr, ann, (H, W)
 
-            s = 1.0
-            target_hw = (H, W)
-            if self.size_multiple:
-                s, target_hw = self._compute_uniform_scale_to_multiple(H, W)
-                if abs(s - 1.0) > 1e-6:
-                    img = self._resize_image(img, target_hw)
-                    H, W = target_hw
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        h5_path, img_idx, start, count = self.entries[index]
+        end = start + count
 
-            K_scaled = self._scale_intrinsics(intr, s) if self.include_intrinsics else None
-            ann = self._scale_annotations(ann, s)
+        img, intr, extr, ann, orig_hw = self._load_raw_sample(
+            h5_path, img_idx, start, end
+        )
 
-            if self.filter is not None:
-                ann = self.filter(ann, H, W)
+        img, K_scaled, ann = self._apply_geometric_transforms(img, intr, ann)
+        H_final, W_final = img.shape[1], img.shape[2]
 
-            if "bbox" in ann and isinstance(ann["bbox"], torch.Tensor):
-                obj_count_after = int(ann["bbox"].shape[0])
-            else:
-                obj_count_after = count  # fallback
+        if self.filter is not None:
+            ann = self.filter(ann, H_final, W_final)
 
-            sample: Dict[str, Any] = {
-                "image": img,  # (3,H,W)
-                "intrinsics": K_scaled if K_scaled is not None else (torch.from_numpy(intr).float() if intr is not None else None),
-                "extrinsics": torch.from_numpy(extr).float() if extr is not None else None,
-                "ann": ann,           # dict: key -> Tensor or list
-                "meta": {
-                    "h5_path": h5_path,
-                    "image_index_in_file": img_idx,
-                    "obj_start": start,
-                    "obj_count_raw": count,
-                    "obj_count": obj_count_after,
-                    "scale": s,
-                    "orig_hw": (int(f[self.image_key].shape[1]), int(f[self.image_key].shape[2])) if False else None,
-                    "resized_hw": (H, W),
-                    "size_multiple": self.size_multiple,
-                    "size_mode": self.size_mode,
-                }
-            }
+        if "bbox" in ann and isinstance(ann["bbox"], torch.Tensor):
+            obj_count_after = int(ann["bbox"].shape[0])
+        else:
+            obj_count_after = count
 
-            return sample
+        sample: Dict[str, Any] = {
+            "image": img,
+            "intrinsics": (
+                K_scaled
+                if K_scaled is not None
+                else (torch.from_numpy(intr).float() if intr is not None else None)
+            ),
+            "extrinsics": torch.from_numpy(extr).float() if extr is not None else None,
+            "ann": ann,
+            "meta": {
+                "h5_path": h5_path,
+                "image_index_in_file": img_idx,
+                "obj_start": start,
+                "obj_count_raw": count,
+                "obj_count": obj_count_after,
+                "orig_hw": orig_hw,
+                "final_hw": (H_final, W_final),
+                "output_size": self.output_size,
+                "augment": self.augment,
+                "scale_range": self.scale_range,
+            },
+        }
+
+        return sample
 
 
 def cuboid_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    images = torch.stack([b["image"] for b in batch], dim=0)  # (B,3,H,W)
+    images = torch.stack([b["image"] for b in batch], dim=0)
     intr_list = [b["intrinsics"] for b in batch]
     extr_list = [b["extrinsics"] for b in batch]
     meta_list = [b["meta"] for b in batch]
@@ -423,13 +667,6 @@ def cuboid_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def get_default_faces():
-    return np.array([
-        [0, 3, 2, 1], [4, 5, 6, 7], [0, 4, 7, 3],
-        [1, 2, 6, 5], [0, 1, 5, 4], [3, 7, 6, 2]
-    ])
-
-
 if __name__ == "__main__":
     root = "dataset"
 
@@ -439,18 +676,22 @@ if __name__ == "__main__":
         include_extrinsics=True,
         min_objects=0,
 
-        # example: make sizes multiples of 32, up-scale only
-        size_multiple=32,
-        size_mode="ceil",       # or "floor"/"round"
-        interp="bilinear",
+        output_size=(384, 640),        # 最終的な (H,W)
+        resize_interp="bilinear",
 
-        remove_oob_center = True,
+        augment=True,
+        scale_range=(0.8, 1.2),
+        random_crop=True,
+        random_hflip=True,
+
+        object_filter="bbox_center",
+        center_margin=0.0,
     )
 
     print("=== Dataset summary ===")
     print(f"Found {len(ds.h5_paths)} h5 files")
     print(f"Total image samples: {len(ds)}")
-    print(f"Example file paths:")
+    print("Example file paths:")
     for p in ds.h5_paths[:3]:
         print("  ", p)
     print("=======================\n")
@@ -475,11 +716,23 @@ if __name__ == "__main__":
 
         for bidx, ann in enumerate(batch["anns"]):
             meta = batch["metas"][bidx]
-            print(f" Sample {bidx}: {meta['h5_path']} [img_idx={meta['image_index_in_file']}]")
+            print(
+                f" Sample {bidx}: {meta['h5_path']} "
+                f"[img_idx={meta['image_index_in_file']}]"
+            )
             print(f"  num_objects: {meta['obj_count']}")
-            print(f"  scale: {meta['scale']:.4f}, resized_hw: {meta['resized_hw']}, k={meta['size_multiple']}, mode={meta['size_mode']}")
+            print(
+                f"  orig_hw: {meta['orig_hw']}, "
+                f"final_hw: {meta['final_hw']}, "
+                f"output_size: {meta['output_size']}, "
+                f"augment: {meta['augment']}, "
+                f"scale_range: {meta['scale_range']}"
+            )
             if "bbox" in ann:
-                print(f"  bbox: shape {ann['bbox'].shape}, example {ann['bbox'][:2]}")
+                print(
+                    f"  bbox: shape {ann['bbox'].shape}, "
+                    f"example {ann['bbox'][:2]}"
+                )
             if "uv" in ann:
                 print(f"  uv: shape {ann['uv'].shape}, example {ann['uv'][:1]}")
             if "visible_faces" in ann:

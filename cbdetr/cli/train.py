@@ -298,15 +298,16 @@ def main():
     # ----------------------------
     # Datasets & loaders (train with optional curriculum)
     # ----------------------------
-    size_multiple = margs.patch_size * margs.num_windows
+    # size_multiple = margs.patch_size * margs.num_windows
 
     use_curriculum = args.train_root_hard is not None
 
     if not use_curriculum:
         train_ds = CuboidDataset(
             root_dir=args.train_root,
-            size_multiple=size_multiple,
-            filter="bbox_center",
+            object_filter="bbox_center",
+            augment=True,
+            output_size=532,
         )
         train_loader = DataLoader(
             train_ds,
@@ -325,13 +326,15 @@ def main():
 
         easy_ds = CuboidDataset(
             root_dir=easy_root,
-            size_multiple=size_multiple,
-            filter="bbox_center",
+            object_filter="bbox_center",
+            augment=True,
+            output_size=532,
         )
         hard_ds = CuboidDataset(
             root_dir=hard_root,
-            size_multiple=size_multiple,
-            filter="bbox_center",
+            object_filter="bbox_center",
+            augment=True,
+            output_size=532,
         )
 
         easy_loader = DataLoader(
@@ -378,8 +381,8 @@ def main():
         if args.val_root is not None and os.path.isdir(args.val_root):
             val_ds = CuboidDataset(
                 root_dir=args.val_root,
-                size_multiple=size_multiple,
-                filter="bbox_center",
+                object_filter="bbox_center",
+                output_size=532,
             )
             val_loader = DataLoader(
                 val_ds,
@@ -393,8 +396,8 @@ def main():
         if args.val_root_easy is not None and os.path.isdir(args.val_root_easy):
             val_easy_ds = CuboidDataset(
                 root_dir=args.val_root_easy,
-                size_multiple=size_multiple,
-                filter="bbox_center",
+                object_filter="bbox_center",
+                output_size=532,
             )
             val_easy_loader = DataLoader(
                 val_easy_ds,
@@ -408,8 +411,8 @@ def main():
         if args.val_root_hard is not None and os.path.isdir(args.val_root_hard):
             val_hard_ds = CuboidDataset(
                 root_dir=args.val_root_hard,
-                size_multiple=size_multiple,
-                filter="bbox_center",
+                object_filter="bbox_center",
+                output_size=532,
             )
             val_hard_loader = DataLoader(
                 val_hard_ds,
