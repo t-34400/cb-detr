@@ -1,16 +1,18 @@
 # ------------------------------------------------------------------------
-# Cuboid-DETR (augmented)
+# Cuboid-DETR Dataset
+# Copyright (c) 2025 t-34400
+# Licensed under the Apache License, Version 2.0 (see LICENSE for details)
 # ------------------------------------------------------------------------
 
 import os
 import glob
-import math
 from typing import Any, Dict, List, Tuple, Optional
 
 import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -40,15 +42,13 @@ class CuboidDataset(Dataset):
         ann_group: str = "ann",
         faces_key: str = "categories/cuboid_topology/faces",
         img2obj_key: str = "img2obj",
-
         output_size: Optional[Tuple[int, int] | int] = None,
         resize_interp: str = "bilinear",
-
         augment: bool = False,
         scale_range: Tuple[float, float] = (0.8, 1.2),
         random_crop: bool = True,
         random_hflip: bool = False,
-
+        photometric_augment: bool = True,
         object_filter: Optional[str] = None,   # None | "bbox_center" | "kp_in_image"
         center_margin: float = 0.0,
     ):
@@ -61,7 +61,6 @@ class CuboidDataset(Dataset):
         self.ann_group = ann_group
         self.img2obj_key = img2obj_key
 
-        # normalize output_size
         if output_size is None:
             self.output_size: Optional[Tuple[int, int]] = None
         elif isinstance(output_size, int):
@@ -75,10 +74,10 @@ class CuboidDataset(Dataset):
         self.scale_range = (float(scale_range[0]), float(scale_range[1]))
         self.random_crop = random_crop
         self.random_hflip = random_hflip
+        self.photometric_augment = photometric_augment
 
         self.center_margin = float(center_margin)
 
-        # select filter function
         self.filter = None
         if object_filter == "bbox_center":
             self.filter = self._filter_objects_by_bbox_center
@@ -147,6 +146,38 @@ class CuboidDataset(Dataset):
         out = F.interpolate(img_bchw, size=target_hw, mode=mode, align_corners=align_corners)
         return out.squeeze(0)
 
+    def _apply_photometric_transforms(self, img: torch.Tensor) -> torch.Tensor:
+        photometric_augment = self.augment and self.photometric_augment
+
+        if not photometric_augment:
+            return img
+
+        if torch.rand(1).item() < 0.8:
+            b = 0.2
+            c = 0.2
+            s = 0.2
+
+            factor = 1.0 + (torch.rand(1).item() * 2 * b - b)
+            img = TF.adjust_brightness(img, factor)
+
+            factor = 1.0 + (torch.rand(1).item() * 2 * c - c)
+            img = TF.adjust_contrast(img, factor)
+
+            factor = 1.0 + (torch.rand(1).item() * 2 * s - s)
+            img = TF.adjust_saturation(img, factor)
+
+        if torch.rand(1).item() < 0.5:
+            gamma = torch.empty(1).uniform_(0.8, 1.2).item()
+            img = TF.adjust_gamma(img, gamma)
+
+        if torch.rand(1).item() < 0.5:
+            std = 0.03
+            noise = torch.randn_like(img) * std
+            img = img + noise
+
+        img = img.clamp(0.0, 1.0)
+        return img
+
     def _scale_intrinsics(
         self,
         intr: Optional[np.ndarray | torch.Tensor],
@@ -160,6 +191,22 @@ class CuboidDataset(Dataset):
             K[1, 1] *= s
             K[0, 2] *= s
             K[1, 2] *= s
+        return K
+
+    def _scale_intrinsics_anisotropic(
+        self,
+        intr: Optional[torch.Tensor],
+        sx: float,
+        sy: float,
+    ) -> Optional[torch.Tensor]:
+        if intr is None:
+            return None
+        K = intr.clone().float()
+        if K.ndim == 2 and K.shape[0] >= 3 and K.shape[1] >= 3:
+            K[0, 0] *= sx
+            K[1, 1] *= sy
+            K[0, 2] *= sx
+            K[1, 2] *= sy
         return K
 
     def _crop_intrinsics(
@@ -195,7 +242,6 @@ class CuboidDataset(Dataset):
         s: float,
     ) -> Dict[str, Any]:
         if s == 1.0:
-            # still convert some arrays to tensors for convenience
             if "visible_edges" in ann and isinstance(ann["visible_edges"], np.ndarray):
                 ann["visible_edges"] = torch.from_numpy(ann["visible_edges"]).to(torch.uint8)
             if "visible_vertices" in ann and isinstance(ann["visible_vertices"], np.ndarray):
@@ -206,46 +252,127 @@ class CuboidDataset(Dataset):
                 ann["vis_ratio"] = torch.from_numpy(ann["vis_ratio"]).float()
             if "pnp_cond_score" in ann and isinstance(ann["pnp_cond_score"], np.ndarray):
                 ann["pnp_cond_score"] = torch.from_numpy(ann["pnp_cond_score"]).float()
+            if "uv" in ann and isinstance(ann["uv"], np.ndarray):
+                ann["uv"] = torch.from_numpy(ann["uv"]).float()
             return ann
 
         if "bbox" in ann:
-            b = torch.from_numpy(ann["bbox"]).float()
+            b_np = ann["bbox"]
+            if isinstance(b_np, np.ndarray):
+                b = torch.from_numpy(b_np).float()
+            else:
+                b = b_np.clone().float()
             b[:, 0:2] *= s
             b[:, 2:4] *= s
             ann["bbox"] = b
 
         if "uv" in ann:
-            uv = torch.from_numpy(ann["uv"]).float()
-            if uv.numel() == 0:
-                ann["uv"] = uv
-            else:
-                maxv = float(uv.abs().max())
-                if maxv > 1.5:  # pixel coordinates
-                    uv[..., 0] *= s
-                    uv[..., 1] *= s
-                ann["uv"] = uv
+            uv = ann["uv"]
+            if isinstance(uv, np.ndarray):
+                ann["uv"] = torch.from_numpy(uv).float()
+            elif isinstance(uv, torch.Tensor):
+                ann["uv"] = uv.float()
 
         if "edge_len_px" in ann:
-            v = torch.from_numpy(ann["edge_len_px"]).float()
+            v_np = ann["edge_len_px"]
+            if isinstance(v_np, np.ndarray):
+                v = torch.from_numpy(v_np).float()
+            else:
+                v = v_np.clone().float()
             ann["edge_len_px"] = v * s
 
         if "full_px" in ann:
-            v = torch.from_numpy(ann["full_px"]).float()
+            v_np = ann["full_px"]
+            if isinstance(v_np, np.ndarray):
+                v = torch.from_numpy(v_np).float()
+            else:
+                v = v_np.clone().float()
             ann["full_px"] = v * (s * s)
+
         if "visible_px" in ann:
-            v = torch.from_numpy(ann["visible_px"]).float()
+            v_np = ann["visible_px"]
+            if isinstance(v_np, np.ndarray):
+                v = torch.from_numpy(v_np).float()
+            else:
+                v = v_np.clone().float()
             ann["visible_px"] = v * (s * s)
 
         if "visible_edges" in ann:
-            ann["visible_edges"] = torch.from_numpy(ann["visible_edges"]).to(torch.uint8)
+            if isinstance(ann["visible_edges"], np.ndarray):
+                ann["visible_edges"] = torch.from_numpy(ann["visible_edges"]).to(torch.uint8)
+            else:
+                ann["visible_edges"] = ann["visible_edges"].to(torch.uint8)
         if "visible_vertices" in ann:
-            ann["visible_vertices"] = torch.from_numpy(ann["visible_vertices"]).to(torch.uint8)
+            if isinstance(ann["visible_vertices"], np.ndarray):
+                ann["visible_vertices"] = torch.from_numpy(ann["visible_vertices"]).to(torch.uint8)
+            else:
+                ann["visible_vertices"] = ann["visible_vertices"].to(torch.uint8)
         if "edge_vis_ratio" in ann:
-            ann["edge_vis_ratio"] = torch.from_numpy(ann["edge_vis_ratio"]).float()
+            if isinstance(ann["edge_vis_ratio"], np.ndarray):
+                ann["edge_vis_ratio"] = torch.from_numpy(ann["edge_vis_ratio"]).float()
+            else:
+                ann["edge_vis_ratio"] = ann["edge_vis_ratio"].float()
         if "vis_ratio" in ann:
-            ann["vis_ratio"] = torch.from_numpy(ann["vis_ratio"]).float()
+            if isinstance(ann["vis_ratio"], np.ndarray):
+                ann["vis_ratio"] = torch.from_numpy(ann["vis_ratio"]).float()
+            else:
+                ann["vis_ratio"] = ann["vis_ratio"].float()
         if "pnp_cond_score" in ann:
-            ann["pnp_cond_score"] = torch.from_numpy(ann["pnp_cond_score"]).float()
+            if isinstance(ann["pnp_cond_score"], np.ndarray):
+                ann["pnp_cond_score"] = torch.from_numpy(ann["pnp_cond_score"]).float()
+            else:
+                ann["pnp_cond_score"] = ann["pnp_cond_score"].float()
+
+        return ann
+
+    def _scale_annotations_anisotropic(
+        self,
+        ann: Dict[str, Any],
+        sx: float,
+        sy: float,
+    ) -> Dict[str, Any]:
+        if "bbox" in ann:
+            b = ann["bbox"]
+            if isinstance(b, np.ndarray):
+                b_t = torch.from_numpy(b).float()
+            else:
+                b_t = b.clone().float()
+            b_t[:, 0] *= sx
+            b_t[:, 1] *= sy
+            b_t[:, 2] *= sx
+            b_t[:, 3] *= sy
+            ann["bbox"] = b_t
+
+        if "uv" in ann:
+            uv = ann["uv"]
+            if isinstance(uv, np.ndarray):
+                ann["uv"] = torch.from_numpy(uv).float()
+            elif isinstance(uv, torch.Tensor):
+                ann["uv"] = uv.float()
+
+        if "edge_len_px" in ann:
+            v = ann["edge_len_px"]
+            if isinstance(v, np.ndarray):
+                v_t = torch.from_numpy(v).float()
+            else:
+                v_t = v.clone().float()
+            ann["edge_len_px"] = v_t * float(0.5 * (sx + sy))
+
+        if "full_px" in ann:
+            v = ann["full_px"]
+            if isinstance(v, np.ndarray):
+                v_t = torch.from_numpy(v).float()
+            else:
+                v_t = v.clone().float()
+            ann["full_px"] = v_t * float(sx * sy)
+
+        if "visible_px" in ann:
+            v = ann["visible_px"]
+            if isinstance(v, np.ndarray):
+                v_t = torch.from_numpy(v).float()
+            else:
+                v_t = v.clone().float()
+            ann["visible_px"] = v_t * float(sx * sy)
 
         return ann
 
@@ -263,12 +390,12 @@ class CuboidDataset(Dataset):
         if "bbox" in ann:
             b = ann["bbox"]
             if isinstance(b, np.ndarray):
-                b = torch.from_numpy(b).float()
+                b_t = torch.from_numpy(b).float()
             else:
-                b = b.clone().float()
-            b[:, 0] -= float(x0)
-            b[:, 1] -= float(y0)
-            ann["bbox"] = b
+                b_t = b.clone().float()
+            b_t[:, 0] -= float(x0)
+            b_t[:, 1] -= float(y0)
+            ann["bbox"] = b_t
 
         if "uv" in ann:
             uv = ann["uv"]
@@ -278,18 +405,12 @@ class CuboidDataset(Dataset):
                 uv_t = uv.clone().float()
 
             if uv_t.numel() > 0:
-                maxv = float(uv_t.abs().max())
-                if maxv <= 1.5:
-                    # uv in [0,1], convert to pixel, apply crop, re-normalize
-                    x_pix = uv_t[..., 0] * float(W_before)
-                    y_pix = uv_t[..., 1] * float(H_before)
-                    x_pix -= float(x0)
-                    y_pix -= float(y0)
-                    uv_t[..., 0] = x_pix / float(W_crop)
-                    uv_t[..., 1] = y_pix / float(H_crop)
-                else:
-                    uv_t[..., 0] -= float(x0)
-                    uv_t[..., 1] -= float(y0)
+                x_pix = uv_t[..., 0] * float(W_before)
+                y_pix = uv_t[..., 1] * float(H_before)
+                x_pix -= float(x0)
+                y_pix -= float(y0)
+                uv_t[..., 0] = x_pix / float(W_crop)
+                uv_t[..., 1] = y_pix / float(H_crop)
             ann["uv"] = uv_t
 
         return ann
@@ -318,14 +439,30 @@ class CuboidDataset(Dataset):
                 uv_t = uv.clone().float()
 
             if uv_t.numel() > 0:
-                maxv = float(uv_t.abs().max())
-                if maxv <= 1.5:  # normalized
-                    uv_t[..., 0] = 1.0 - uv_t[..., 0]
-                else:  # pixel
-                    uv_t[..., 0] = (W - 1.0) - uv_t[..., 0]
+                uv_t[..., 0] = 1.0 - uv_t[..., 0]
             ann["uv"] = uv_t
 
         return ann
+
+    def _random_or_center_crop_coords(
+        self,
+        H: int,
+        W: int,
+        out_h: int,
+        out_w: int,
+        random_crop: bool,
+    ) -> Tuple[int, int]:
+        if H <= out_h or W <= out_w:
+            return 0, 0
+        if random_crop:
+            max_y = H - out_h
+            max_x = W - out_w
+            y0 = int(torch.randint(0, max_y + 1, (1,)).item())
+            x0 = int(torch.randint(0, max_x + 1, (1,)).item())
+        else:
+            y0 = (H - out_h) // 2
+            x0 = (W - out_w) // 2
+        return y0, x0
 
     # ---------------------------------------------------------------------
     # object filters
@@ -404,9 +541,9 @@ class CuboidDataset(Dataset):
 
         uv = ann["uv"]
         if isinstance(uv, torch.Tensor):
-            uv_t = uv
+            uv_t = uv.float()
         elif isinstance(uv, np.ndarray):
-            uv_t = torch.from_numpy(uv)
+            uv_t = torch.from_numpy(uv).float()
         else:
             return ann
 
@@ -424,11 +561,7 @@ class CuboidDataset(Dataset):
         x = uv_t[..., 0]
         y = uv_t[..., 1]
 
-        maxv = float(uv_t.abs().max())
-        if maxv <= 1.5:
-            mask_pts = (x >= 0.0) & (x <= 1.0) & (y >= 0.0) & (y <= 1.0)
-        else:
-            mask_pts = (x >= 0.0) & (x < float(W)) & (y >= 0.0) & (y < float(H))
+        mask_pts = (x >= 0.0) & (x <= 1.0) & (y >= 0.0) & (y <= 1.0)
 
         mask_obj = mask_pts.view(N, -1).all(dim=1)
         if mask_obj.all():
@@ -460,7 +593,7 @@ class CuboidDataset(Dataset):
         return new_ann
 
     # ---------------------------------------------------------------------
-    # augmentation
+    # augmentation (geometry)
     # ---------------------------------------------------------------------
 
     def _sample_scale(self, H: int, W: int) -> float:
@@ -471,29 +604,8 @@ class CuboidDataset(Dataset):
             return 1.0
         if s_min <= 0.0:
             s_min = 1e-6
-        # use torch.rand so it is on the same RNG stream as other ops
         r = torch.rand(1).item()
         return s_min + (s_max - s_min) * r
-
-    def _random_or_center_crop_coords(
-        self,
-        H: int,
-        W: int,
-        out_h: int,
-        out_w: int,
-        random_crop: bool,
-    ) -> Tuple[int, int]:
-        if H <= out_h or W <= out_w:
-            return 0, 0
-        if random_crop:
-            max_y = H - out_h
-            max_x = W - out_w
-            y0 = int(torch.randint(0, max_y + 1, (1,)).item())
-            x0 = int(torch.randint(0, max_x + 1, (1,)).item())
-        else:
-            y0 = (H - out_h) // 2
-            x0 = (W - out_w) // 2
-        return y0, x0
 
     def _apply_geometric_transforms(
         self,
@@ -504,25 +616,13 @@ class CuboidDataset(Dataset):
         _, H0, W0 = img.shape
         out_hw = self.output_size
 
-        # 1) scaling
         if self.augment:
             s = self._sample_scale(H0, W0)
         else:
-            # deterministic scale so that shorter side >= output_size (if given)
-            if out_hw is None:
-                s = 1.0
-            else:
-                out_h, out_w = out_hw
-                s_h = out_h / H0
-                s_w = out_w / W0
-                s = max(s_h, s_w, 1e-6)
+            s = 1.0
 
-        H1 = int(round(H0 * s))
-        W1 = int(round(W0 * s))
-        if H1 <= 0:
-            H1 = 1
-        if W1 <= 0:
-            W1 = 1
+        H1 = max(1, int(round(H0 * s)))
+        W1 = max(1, int(round(W0 * s)))
 
         if s != 1.0:
             img = self._resize_image(img, (H1, W1))
@@ -532,45 +632,44 @@ class CuboidDataset(Dataset):
         K = self._scale_intrinsics(intr, s) if self.include_intrinsics else None
         ann = self._scale_annotations_uniform(ann, s)
 
-        # 2) crop to output size (if requested)
         if out_hw is not None:
             out_h, out_w = out_hw
-            # if scaled image smaller than target, fallback to top-left crop
-            if H1 < out_h or W1 < out_w:
-                y0, x0 = 0, 0
-                out_h_eff = min(out_h, H1)
-                out_w_eff = min(out_w, W1)
-            else:
-                y0, x0 = self._random_or_center_crop_coords(
-                    H1, W1, out_h, out_w, self.random_crop if self.augment else False
-                )
-                out_h_eff, out_w_eff = out_h, out_w
 
-            img = img[:, y0 : y0 + out_h_eff, x0 : x0 + out_w_eff]
-            H2, W2 = img.shape[1], img.shape[2]
+            if H1 <= out_h and W1 <= out_w:
+                y0, x0 = 0, 0
+                crop_h, crop_w = H1, W1
+            else:
+                crop_h = min(out_h, H1)
+                crop_w = min(out_w, W1)
+                y0, x0 = self._random_or_center_crop_coords(
+                    H1, W1, crop_h, crop_w, self.random_crop if self.augment else False
+                )
+
+            img = img[:, y0 : y0 + crop_h, x0 : x0 + crop_w]
+            H2, W2 = crop_h, crop_w
 
             K = self._crop_intrinsics(K, x0, y0)
             ann = self._crop_annotations(ann, x0, y0, (H2, W2), (H1, W1))
-
-            # if we had to crop smaller than requested (image too small), pad
-            if (H2, W2) != (out_h, out_w):
-                pad_bottom = out_h - H2
-                pad_right = out_w - W2
-                pad_bottom = max(pad_bottom, 0)
-                pad_right = max(pad_right, 0)
-                # pad: (left, right, top, bottom)
-                img = F.pad(img, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
-                # padding adds black border; intrinsics shift is already correct
-                # annotations remain in the same coordinates
         else:
-            out_h, out_w = H1, W1
+            H2, W2 = H1, W1
 
-        # 3) horizontal flip
+        if out_hw is not None:
+            out_h, out_w = out_hw
+            sy = out_h / float(H2)
+            sx = out_w / float(W2)
+
+            img = self._resize_image(img, (out_h, out_w))
+            K = self._scale_intrinsics_anisotropic(K, sx, sy)
+            ann = self._scale_annotations_anisotropic(ann, sx, sy)
+            H_final, W_final = out_h, out_w
+        else:
+            H_final, W_final = H2, W2
+
         if self.augment and self.random_hflip:
             if torch.rand(1).item() < 0.5:
                 img = torch.flip(img, dims=[2])
-                K = self._hflip_intrinsics(K, out_w)
-                ann = self._hflip_annotations(ann, out_w)
+                K = self._hflip_intrinsics(K, W_final)
+                ann = self._hflip_annotations(ann, W_final)
 
         return img, K, ann
 
@@ -617,6 +716,8 @@ class CuboidDataset(Dataset):
 
         img, K_scaled, ann = self._apply_geometric_transforms(img, intr, ann)
         H_final, W_final = img.shape[1], img.shape[2]
+
+        img = self._apply_photometric_transforms(img)
 
         if self.filter is not None:
             ann = self.filter(ann, H_final, W_final)
@@ -675,15 +776,12 @@ if __name__ == "__main__":
         include_intrinsics=True,
         include_extrinsics=True,
         min_objects=0,
-
-        output_size=(384, 640),        # 最終的な (H,W)
+        output_size=(384, 640),
         resize_interp="bilinear",
-
         augment=True,
         scale_range=(0.8, 1.2),
         random_crop=True,
         random_hflip=True,
-
         object_filter="bbox_center",
         center_margin=0.0,
     )
