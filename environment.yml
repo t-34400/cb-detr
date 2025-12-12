@@ -1,0 +1,24 @@
+name: cb-detr
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4
+
+  - cython
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+
+  - pip:
+      - "-e ."

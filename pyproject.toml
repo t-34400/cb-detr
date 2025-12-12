@@ -1,0 +1,102 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuboid-detr"
+version = "0.1.0"
+description = "Cuboid-DETR: a derivative of RF-DETR for cuboid detection"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "t-34400"}
+]
+license = {text = "Apache License 2.0"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development",
+    "Operating System :: POSIX",
+    "Operating System :: Unix",
+    "Operating System :: MacOS"
+]
+keywords = ["machine-learning", "deep-learning", "vision", "DETR", "Cuboid-DETR", "cuboid", "object-detection"]
+
+dependencies = [
+    "cython",
+    "pycocotools",
+    "torch>=1.13.0",
+    "torchvision>=0.14.0",
+    "fairscale",
+    "scipy",
+    "h5py",
+    "timm",
+    "tqdm",
+    "numpy",
+    "accelerate",
+    "transformers",
+    "peft",
+    "ninja",
+    "einops",
+    "pandas",
+    "pylabel",
+    "polygraphy",
+    "open_clip_torch",
+    "rf100vl",
+    "pydantic",
+    "supervision",
+    "matplotlib",
+    "tensorboard>=2.13.0",
+    "roboflow"
+]
+
+[project.optional-dependencies]
+onnxexport = [
+    "onnx",
+    "onnxsim",
+    "onnx_graphsurgeon",
+    "onnxruntime"
+]
+metrics = [
+    "wandb"
+]
+docs = [
+    "mkdocs-material[imaging]>=9.5.5",
+    "mkdocstrings>=0.25.2,<0.30.0",
+    "mkdocstrings-python>=1.10.9",
+    "mike>=2.0.0",
+    "mkdocs-jupyter>=0.24.3",
+    "mkdocs-git-committers-plugin-2>=2.4.1; python_version >= '3.8' and python_version < '4'",
+    "mkdocs-git-revision-date-localized-plugin>=1.2.4"
+]
+build = [
+    "twine>=5.1.1",
+    "wheel>=0.40",
+    "build>=0.10"
+]
+
+[project.urls]
+Homepage = "https://github.com/t-34400/cb-detr"
+Repository = "https://github.com/t-34400/cb-detr"
+Issues = "https://github.com/t-34400/cb-detr/issues"
+
+[project.scripts]
+cbdetr = "cbdetr.cli.train:main"
+
+[tool.setuptools.packages.find]
+include = ["cbdetr*"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.package-data]
+cbdetr = ["py.typed", "models/backbone/dinov2_configs/*.json"]
