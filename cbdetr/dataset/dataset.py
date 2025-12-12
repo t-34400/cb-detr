@@ -137,47 +137,6 @@ class CuboidDataset(Dataset):
             out.append(np.array(v))
         return out
 
-    def _resize_image(
-        self, img_chw: torch.Tensor, target_hw: Tuple[int, int]
-    ) -> torch.Tensor:
-        img_bchw = img_chw.unsqueeze(0)
-        mode = self.resize_interp
-        align_corners = False if mode in ("bilinear", "bicubic") else None
-        out = F.interpolate(img_bchw, size=target_hw, mode=mode, align_corners=align_corners)
-        return out.squeeze(0)
-
-    def _apply_photometric_transforms(self, img: torch.Tensor) -> torch.Tensor:
-        photometric_augment = self.augment and self.photometric_augment
-
-        if not photometric_augment:
-            return img
-
-        if torch.rand(1).item() < 0.8:
-            b = 0.2
-            c = 0.2
-            s = 0.2
-
-            factor = 1.0 + (torch.rand(1).item() * 2 * b - b)
-            img = TF.adjust_brightness(img, factor)
-
-            factor = 1.0 + (torch.rand(1).item() * 2 * c - c)
-            img = TF.adjust_contrast(img, factor)
-
-            factor = 1.0 + (torch.rand(1).item() * 2 * s - s)
-            img = TF.adjust_saturation(img, factor)
-
-        if torch.rand(1).item() < 0.5:
-            gamma = torch.empty(1).uniform_(0.8, 1.2).item()
-            img = TF.adjust_gamma(img, gamma)
-
-        if torch.rand(1).item() < 0.5:
-            std = 0.03
-            noise = torch.randn_like(img) * std
-            img = img + noise
-
-        img = img.clamp(0.0, 1.0)
-        return img
-
     def _scale_intrinsics(
         self,
         intr: Optional[np.ndarray | torch.Tensor],
@@ -672,6 +631,66 @@ class CuboidDataset(Dataset):
                 ann = self._hflip_annotations(ann, W_final)
 
         return img, K, ann
+
+    # ---------------------------------------------------------------------
+    # augmentation (photometry)
+    # ---------------------------------------------------------------------
+
+    def _resize_image(
+        self, img_chw: torch.Tensor, target_hw: Tuple[int, int]
+    ) -> torch.Tensor:
+        img_bchw = img_chw.unsqueeze(0)
+        mode = self.resize_interp
+        align_corners = False if mode in ("bilinear", "bicubic") else None
+        out = F.interpolate(img_bchw, size=target_hw, mode=mode, align_corners=align_corners)
+        return out.squeeze(0)
+
+    def _degrade_resolution(self, img: torch.Tensor) -> torch.Tensor:
+        if not self.augment:
+            return img
+        if torch.rand(1).item() > 0.3:
+            return img
+        _, H, W = img.shape
+        scale = torch.empty(1).uniform_(0.5, 0.9).item()
+        h_small = max(8, int(H * scale))
+        w_small = max(8, int(W * scale))
+        img_small = F.interpolate(img.unsqueeze(0), size=(h_small, w_small), mode="bilinear", align_corners=False)
+        img_back = F.interpolate(img_small, size=(H, W), mode="bilinear", align_corners=False)
+        return img_back.squeeze(0)
+
+    def _apply_photometric_transforms(self, img: torch.Tensor) -> torch.Tensor:
+        photometric_augment = self.augment and self.photometric_augment
+
+        if not photometric_augment:
+            return img
+
+        if torch.rand(1).item() < 0.8:
+            b = 0.2
+            c = 0.2
+            s = 0.2
+
+            factor = 1.0 + (torch.rand(1).item() * 2 * b - b)
+            img = TF.adjust_brightness(img, factor)
+
+            factor = 1.0 + (torch.rand(1).item() * 2 * c - c)
+            img = TF.adjust_contrast(img, factor)
+
+            factor = 1.0 + (torch.rand(1).item() * 2 * s - s)
+            img = TF.adjust_saturation(img, factor)
+
+        if torch.rand(1).item() < 0.5:
+            gamma = torch.empty(1).uniform_(0.8, 1.2).item()
+            img = TF.adjust_gamma(img, gamma)
+
+        if torch.rand(1).item() < 0.5:
+            std = 0.03
+            noise = torch.randn_like(img) * std
+            img = img + noise
+
+        img = self._degrade_resolution(img)
+
+        img = img.clamp(0.0, 1.0)
+        return img
 
     # ---------------------------------------------------------------------
     # IO
