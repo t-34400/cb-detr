@@ -116,27 +116,35 @@ def compute_total_loss(
 
     kp_losses_main = cuboid_kp_losses(
         outputs, targets, kp_match_results,
-        lambda_kp=lambda_kp,
-        lambda_bbox_kp=lambda_bbox_kp,
-        lambda_edge=lambda_edge,
-        lambda_face=lambda_face,
-        lambda_rep=lambda_rep,
-        lambda_kp_coarse=lambda_kp_coarse,
-        lambda_edge_coarse=lambda_edge_coarse,
         use_huber=use_huber
     )
 
     # -------- 5) Aggregate losses (MAIN layer) --------
+    loss_kp          = lambda_kp          * kp_losses_main["loss_kp"]
+    loss_bbox_kp     = lambda_bbox_kp     * kp_losses_main["loss_bbox_kp"]
+    loss_edge        = lambda_edge        * kp_losses_main["loss_edge"]
+    loss_face        = lambda_face        * kp_losses_main["loss_face"]
+    loss_rep         = lambda_rep         * kp_losses_main["loss_rep"]
+    loss_kp_coarse   = lambda_kp_coarse   * kp_losses_main["loss_kp_coarse"]
+    loss_edge_coarse = lambda_edge_coarse * kp_losses_main["loss_edge_coarse"]
+    loss_kp_total = (
+        loss_kp + loss_bbox_kp 
+        + loss_edge + loss_face + loss_rep
+        + loss_kp_coarse + loss_edge_coarse
+    )
+
     losses = {
         "loss_cls": loss_cls,
         "loss_bbox_l1": lambda_bbox_l1   * loss_bbox_l1,
         "loss_bbox_giou": lambda_bbox_giou * loss_giou,
-        "loss_kp": kp_losses_main["loss_kp"] * 1.0,
-        "loss_bbox_kp": kp_losses_main["loss_bbox_kp"] * 1.0,
-        "loss_edge": kp_losses_main["loss_edge"] * 1.0,
-        "loss_face": kp_losses_main["loss_face"] * 1.0,
-        "loss_rep":  kp_losses_main["loss_rep"] * 1.0,
-        "loss_kp_total": kp_losses_main["loss_kp_total"] * 1.0
+        "loss_kp": loss_kp,
+        "loss_bbox_kp": loss_bbox_kp,
+        "loss_edge": loss_edge,
+        "loss_face": loss_face,
+        "loss_rep": loss_rep,
+        "loss_kp_coarse": loss_kp_coarse,
+        "loss_edge_coarse": loss_edge_coarse,
+        "loss_kp_total": loss_kp_total
     }
 
     loss_total = (
@@ -184,28 +192,34 @@ def compute_total_loss(
             # ---- 6.3 kp + structure losses for aux (reuse kp_match_results) ----
             aux_kp_losses = cuboid_kp_losses(
                 aux, targets, kp_match_results,
-                lambda_kp=lambda_kp,
-                lambda_bbox_kp=lambda_bbox_kp,
-                lambda_edge=lambda_edge,
-                lambda_face=lambda_face,
-                lambda_rep=lambda_rep,
-                lambda_kp_coarse=lambda_kp_coarse,
-                lambda_edge_coarse=lambda_edge_coarse,
                 use_huber=use_huber
+            )
+
+            aux_loss_kp          = lambda_kp          * aux_kp_losses["loss_kp"]
+            aux_loss_bbox_kp     = lambda_bbox_kp     * aux_kp_losses["loss_bbox_kp"]
+            aux_loss_edge        = lambda_edge        * aux_kp_losses["loss_edge"]
+            aux_loss_face        = lambda_face        * aux_kp_losses["loss_face"]
+            aux_loss_rep         = lambda_rep         * aux_kp_losses["loss_rep"]
+            aux_loss_kp_coarse   = lambda_kp_coarse   * aux_kp_losses["loss_kp_coarse"]
+            aux_loss_edge_coarse = lambda_edge_coarse * aux_kp_losses["loss_edge_coarse"]
+            aux_loss_kp_total = (
+                aux_loss_kp + aux_loss_bbox_kp 
+                + aux_loss_edge + aux_loss_face + aux_loss_rep
+                + aux_loss_kp_coarse + aux_loss_edge_coarse
             )
 
             aux_total = (
                 aux_loss_cls
                 + lambda_bbox_l1 * aux_l1
                 + lambda_bbox_giou * aux_giou
-                + aux_kp_losses["loss_kp_total"]
+                + aux_loss_kp_total
             )
             aux_losses_total.append(aux_total)
 
             losses[f"loss_aux_{i}_cls"] = aux_loss_cls
             losses[f"loss_aux_{i}_bbox_l1"] = lambda_bbox_l1 * aux_l1
             losses[f"loss_aux_{i}_bbox_giou"] = lambda_bbox_giou * aux_giou
-            losses[f"loss_aux_{i}_kp_total"] = aux_kp_losses["loss_kp_total"]
+            losses[f"loss_aux_{i}_kp_total"] = aux_loss_kp_total
 
         if len(aux_losses_total) > 0:
             losses["aux_loss"] = torch.stack(aux_losses_total).mean()

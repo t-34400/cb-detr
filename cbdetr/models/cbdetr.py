@@ -16,7 +16,7 @@
 
 import copy
 import math
-from typing import Callable
+from typing import Callable, List, Tuple
 
 import torch
 from torch import nn
@@ -25,17 +25,86 @@ import torch.nn.functional as F
 from .util.misc import NestedTensor, nested_tensor_from_tensor_list
 from .transformer import MLP
 
+from cbdetr.util.cuboid_topology import EDGES
+
+
+class HighFreqEnhancer(nn.Module):
+    def __init__(self, channels: int, init_scale: float = 0.5):
+        super().__init__()
+        self.blur = nn.Conv2d(
+            channels, channels, 3, padding=1, groups=channels, bias=False
+        )
+        nn.init.constant_((self.blur.weight), 1.0 / 9.0)
+        self.blur.weight.requires_grad = False
+        self.scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        blur = self.blur(x)
+        hf = x - blur
+        return x + self.scale * hf
+
+
+class ImageHFEncoder(nn.Module):
+    """Lightweight line-aware encoder for high-frequency image features."""
+
+    def __init__(self, out_channels: int):
+        super().__init__()
+        mid = max(out_channels // 2, 16)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, mid, 3, padding=1, bias=False),
+            nn.GELU(),
+        )
+
+        # Depthwise convolutions emphasize horizontal and vertical line structures.
+        self.dw_h = nn.Conv2d(
+            mid,
+            mid,
+            kernel_size=(1, 3),
+            padding=(0, 1),
+            groups=mid,
+            bias=False,
+        )
+        self.dw_v = nn.Conv2d(
+            mid,
+            mid,
+            kernel_size=(3, 1),
+            padding=(1, 0),
+            groups=mid,
+            bias=False,
+        )
+
+        self.proj = nn.Conv2d(mid, out_channels, kernel_size=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        h = self.dw_h(x)
+        v = self.dw_v(x)
+        x = x + h + v
+        x = self.proj(x)
+        return F.gelu(x)
+
 
 class KeypointNeck(nn.Module):
+    """
+    Multi-scale fusion neck for keypoint feature map.
+
+    Design choices:
+      - Fuse backbone scales at the resolution of the first feature.
+      - No global upsampling; only local sampling is used later.
+      - Optional small refinement conv block.
+      - Final 2x upsampling to increase effective spatial resolution.
+    """
+
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
         num_scales: int,
-        upsample_factor: float = 1.0,
+        refine: bool = True,
+        use_hf_enhancer: bool = True,
     ):
         super().__init__()
-        self.upsample_factor = upsample_factor
 
         self.proj_convs = nn.ModuleList(
             [
@@ -44,17 +113,20 @@ class KeypointNeck(nn.Module):
             ]
         )
 
-        if upsample_factor != 1.0:
-            self.refine = nn.Sequential(
+        self.refine = (
+            nn.Sequential(
                 nn.Conv2d(out_channels, out_channels, 3, padding=1),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(out_channels, out_channels, 3, padding=1),
                 nn.ReLU(inplace=True),
             )
-        else:
-            self.refine = None
+            if refine
+            else None
+        )
 
-    def forward(self, feats):
+        self.hf = HighFreqEnhancer(out_channels) if use_hf_enhancer else None
+
+    def forward(self, feats: List[torch.Tensor]) -> torch.Tensor:
         if isinstance(feats, torch.Tensor):
             feats = [feats]
 
@@ -76,20 +148,24 @@ class KeypointNeck(nn.Module):
 
         fused = fused.to(dtype)
 
-        if self.upsample_factor != 1.0:
-            fused = F.interpolate(
-                fused,
-                scale_factor=self.upsample_factor,
-                mode="bilinear",
-                align_corners=False,
-            )
+        if self.refine is not None:
             fused = self.refine(fused)
+
+        if self.hf is not None:
+            fused = self.hf(fused)
+
+        fused = F.interpolate(
+            fused,
+            scale_factor=2.0,
+            mode="bilinear",
+            align_corners=False,
+        )
 
         return fused
 
 
 class CuboidJointDecoder(nn.Module):
-    """Joint refinement for all cuboid vertices via self-attention."""
+    """Joint refinement for all cuboid vertices via transformer encoder."""
 
     def __init__(
         self,
@@ -114,7 +190,6 @@ class CuboidJointDecoder(nn.Module):
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
         self.output_head = nn.Linear(d_model, out_dim)
-
         self.kp_type_embed = nn.Embedding(num_kp, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -134,7 +209,6 @@ class CuboidJointDecoder(nn.Module):
 
         x = self.encoder(x)
         delta = self.output_head(x)
-
         delta = delta.view(B, Nq, K, -1)
         return delta
 
@@ -150,7 +224,6 @@ class CuboidDetr(nn.Module):
         aux_loss: bool = False,
         lite_refpoint_refine: bool = False,
         bbox_reparam: bool = False,
-        kp_upsample_factor: float = 1.0,
     ):
         super().__init__()
 
@@ -175,9 +248,8 @@ class CuboidDetr(nn.Module):
         self.class_embed = nn.Linear(d_model, num_classes)
         self.bbox_embed = MLP(d_model, d_model, 4, 3)
 
-        query_dim = self.refpoint_dim
         total_queries = num_queries * group_detr
-        self.refpoint_embed = nn.Embedding(total_queries, query_dim)
+        self.refpoint_embed = nn.Embedding(total_queries, self.refpoint_dim)
         self.query_feat = nn.Embedding(total_queries, d_model)
 
         self.kp_coarse_head = MLP(d_model + 4, d_model, self.kp_dim, 3)
@@ -198,10 +270,20 @@ class CuboidDetr(nn.Module):
             in_channels=kp_in_channels,
             out_channels=self.kp_feat_dim,
             num_scales=kp_num_scales,
-            upsample_factor=kp_upsample_factor,
+            refine=True,
+            use_hf_enhancer=True,
         )
 
-        refine_in_dim = d_model + 4 + 2 + self.kp_feat_dim
+        self.img_hf_encoder = ImageHFEncoder(self.kp_feat_dim)
+        self.kp_fuse = nn.Conv2d(self.kp_feat_dim * 2, self.kp_feat_dim, kernel_size=1)
+
+        refine_in_dim = (
+            d_model  # query feature
+            + 4  # bbox(xywh)
+            + 2  # coarse kp offset
+            + self.kp_feat_dim  # point-based feature
+            + self.kp_feat_dim  # edge-based feature
+        )
 
         self.num_kp_samples = 4
         self.sample_offset_scale = 0.25
@@ -217,6 +299,31 @@ class CuboidDetr(nn.Module):
             self.num_kp_samples,
             3,
         )
+
+        self.num_edge_samples = 8
+        self.register_buffer("edges", EDGES)  # (E, 2)
+
+        edge_in_dim = d_model + 4
+        self.edge_sample_head = MLP(edge_in_dim, d_model, self.num_edge_samples, 3)
+
+        K = self.num_kp
+        E = EDGES.shape[0]
+        vertex_edge_mask = torch.zeros(K, E, dtype=torch.float32)
+        for e in range(E):
+            i, j = EDGES[e]
+            vertex_edge_mask[i, e] = 1.0
+            vertex_edge_mask[j, e] = 1.0
+        self.register_buffer("vertex_edge_mask", vertex_edge_mask)
+
+        deg = vertex_edge_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        self.register_buffer("vertex_edge_deg_inv", 1.0 / deg)
+
+        Ck = self.kp_feat_dim
+        C_ctx = self.kp_feat_dim
+
+        self.edge_att_q = nn.Linear(C_ctx, Ck // 2)
+        self.edge_att_k = nn.Linear(Ck, Ck // 2)
+        self.edge_att_v = nn.Linear(Ck, Ck)
 
         self.kp_joint_decoder = CuboidJointDecoder(
             in_dim=refine_in_dim,
@@ -297,16 +404,44 @@ class CuboidDetr(nn.Module):
             ):
                 m.export()
 
+    def _compute_kp_feat_map(
+        self,
+        features: List[NestedTensor],
+        images: torch.Tensor,
+        detach_backbone: bool,
+    ) -> torch.Tensor:
+        feat_tensors = [feat.tensors for feat in features]
+        if detach_backbone:
+            feat_tensors = [t.detach() for t in feat_tensors]
+
+        kp_feat_map = self.kp_neck(feat_tensors)
+
+        B, _, Hk, Wk = kp_feat_map.shape
+        img_resized = F.interpolate(
+            images,
+            size=(Hk, Wk),
+            mode="bilinear",
+            align_corners=False,
+        )
+        img_hf = self.img_hf_encoder(img_resized)
+
+        fused = torch.cat([kp_feat_map, img_hf], dim=1)
+        kp_feat_map = self.kp_fuse(fused)
+        return kp_feat_map
+
     def forward(self, samples: NestedTensor):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
 
+        images = samples.tensors  # (B, 3, H, W)
         features, poss = self.backbone(samples)
         srcs, masks = zip(*(feat.decompose() for feat in features))
         srcs = list(srcs)
         masks = list(masks)
 
-        kp_feat_map = self.kp_neck([feat.tensors.detach() for feat in features])
+        kp_feat_map = self._compute_kp_feat_map(
+            features=features, images=images, detach_backbone=True
+        )
 
         if self.training:
             ref_w = self.refpoint_embed.weight
@@ -359,12 +494,15 @@ class CuboidDetr(nn.Module):
         if isinstance(tensors, (list, torch.Tensor)):
             tensors = nested_tensor_from_tensor_list(tensors)
 
+        images = tensors.tensors
         features, poss = self.backbone(tensors)
         srcs, masks = zip(*(feat.decompose() for feat in features))
         srcs = list(srcs)
         masks = list(masks)
 
-        kp_feat_map = self.kp_neck([feat.tensors for feat in features])
+        kp_feat_map = self._compute_kp_feat_map(
+            features=features, images=images, detach_backbone=False
+        )
 
         ref_w = self.refpoint_embed.weight[: self.num_queries]
         qry_w = self.query_feat.weight[: self.num_queries]
@@ -391,6 +529,145 @@ class CuboidDetr(nn.Module):
             out["pred_kp_coarse"],
         )
 
+    def _sample_kp_point_features(
+        self,
+        h: torch.Tensor,              # (B, Nq, Cq)
+        boxes: torch.Tensor,          # (B, Nq, 4) in [0,1]
+        kp_rel_coarse: torch.Tensor,  # (B, Nq, K, 2) in [-1,1]
+        kp_feat_map: torch.Tensor,    # (B, Ck, Hk, Wk)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            sampled: (B, Nq, K, Ck)
+            h_exp:   (B, Nq, K, Cq)  # query feature per KP
+            box_exp: (B, Nq, K, 4)   # bbox per KP
+        """
+        B, Nq, _ = h.shape
+        K = self.num_kp
+        Ck = self.kp_feat_dim
+        num_samples = self.num_kp_samples
+
+        box_center_2d = boxes[..., :2]
+        box_wh_2d = boxes[..., 2:]
+
+        box_center = box_center_2d.unsqueeze(2).unsqueeze(3)  # (B, Nq, 1, 1, 2)
+        box_wh = box_wh_2d.unsqueeze(2).unsqueeze(3)          # (B, Nq, 1, 1, 2)
+
+        h_exp = h.unsqueeze(2).expand(-1, -1, K, -1)
+        box_exp = boxes.unsqueeze(2).expand(-1, -1, K, -1)
+
+        sample_in = torch.cat(
+            [h_exp.detach(), box_exp.detach(), kp_rel_coarse.detach()],
+            dim=-1,
+        )  # (B, Nq, K, Cq+4+2)
+
+        sample_in_flat = sample_in.view(B * Nq * K, -1)
+        sample_offset_flat = self.kp_sample_offset_head(sample_in_flat)
+        sample_weight_flat = self.kp_sample_weight_head(sample_in_flat)
+
+        sample_offset = torch.tanh(
+            sample_offset_flat.view(B, Nq, K, num_samples, 2)
+        ) * self.sample_offset_scale
+        sample_weight = sample_weight_flat.view(B, Nq, K, num_samples)
+
+        kp_rel_sample = kp_rel_coarse.detach().unsqueeze(3) + sample_offset
+        sample_pos = box_center + 0.5 * kp_rel_sample * box_wh  # (B,Nq,K,S,2), in [0,1]
+
+        grid = sample_pos * 2.0 - 1.0
+        grid = grid.view(B, Nq * K, num_samples, 2)
+
+        sampled_multi = F.grid_sample(
+            kp_feat_map, grid, align_corners=False
+        )  # (B, Ck, Nq*K*S, 1)
+
+        sampled_multi = sampled_multi.view(
+            B, Ck, Nq, K, num_samples
+        ).permute(0, 2, 3, 4, 1)  # (B, Nq, K, S, Ck)
+
+        att = F.softmax(sample_weight, dim=-1)  # (B,Nq,K,S)
+        sampled_flat = sampled_multi.reshape(
+            B * Nq * K, num_samples, Ck
+        )
+        att_flat = att.reshape(B * Nq * K, num_samples, 1)
+        sampled_agg = (att_flat * sampled_flat).sum(dim=1)
+        sampled = sampled_agg.view(B, Nq, K, Ck)
+
+        return sampled, h_exp, box_exp
+
+    def _sample_edge_features_raw(
+        self,
+        kp_feat_map: torch.Tensor,     # (B, Ck, Hk, Wk)
+        pred_kp_coarse: torch.Tensor,  # (B, Nq, K, 2)
+        h: torch.Tensor,               # (B, Nq, Cq)
+    ) -> torch.Tensor:
+        """
+        Sample edge features along predicted coarse keypoints using
+        learnable sampling positions per edge and query.
+        """
+        B, Ck, Hk, Wk = kp_feat_map.shape
+        B2, Nq, K, _ = pred_kp_coarse.shape
+        assert B == B2 and K == self.num_kp
+
+        edges = self.edges  # (E, 2)
+        E = edges.shape[0]
+        num_samples = self.num_edge_samples
+
+        p_u = pred_kp_coarse[:, :, edges[:, 0], :]  # (B, Nq, E, 2)
+        p_v = pred_kp_coarse[:, :, edges[:, 1], :]  # (B, Nq, E, 2)
+
+        # Broadcast query features to per-edge context.
+        h_edge = h.unsqueeze(2).expand(-1, -1, E, -1)  # (B, Nq, E, Cq)
+
+        edge_in = torch.cat([h_edge, p_u, p_v], dim=-1)  # (B, Nq, E, Cq+4+4)
+        edge_in_flat = edge_in.view(B * Nq * E, -1)
+
+        s_raw = self.edge_sample_head(edge_in_flat)  # (B*Nq*E, S)
+        s = torch.sigmoid(s_raw).view(
+            B, Nq, E, num_samples, 1
+        )  # (B, Nq, E, S, 1) in [0,1]
+
+        p_line = (1.0 - s) * p_u.unsqueeze(3) + s * p_v.unsqueeze(3)
+
+        grid = p_line.view(B, Nq * E * num_samples, 1, 2) * 2.0 - 1.0
+
+        sampled = F.grid_sample(
+            kp_feat_map, grid, align_corners=False
+        )
+
+        sampled = sampled.view(B, Ck, Nq, E, num_samples).permute(
+            0, 2, 3, 4, 1
+        )
+
+        edge_feat = sampled.mean(dim=3)  # (B, Nq, E, Ck)
+        return edge_feat
+
+    def _aggregate_edge_features(
+        self,
+        edge_feat: torch.Tensor,     # (B, Nq, E, Ck)
+        kp_point_feat: torch.Tensor, # (B, Nq, K, C_ctx)
+    ) -> torch.Tensor:
+        B, Nq, E, Ck = edge_feat.shape
+        _, _, K, C_ctx = kp_point_feat.shape
+
+        Q = self.edge_att_q(kp_point_feat)        # (B, Nq, K, D)
+        K_e = self.edge_att_k(edge_feat)          # (B, Nq, E, D)
+        V_e = self.edge_att_v(edge_feat)          # (B, Nq, E, Ck)
+
+        Q = Q.unsqueeze(3)                        # (B, Nq, K, 1, D)
+        K_e = K_e.unsqueeze(2)                    # (B, Nq, 1, E, D)
+        logits = (Q * K_e).sum(-1)                # (B, Nq, K, E)
+
+        mask = self.vertex_edge_mask.view(1, 1, K, E)
+        logits = logits.masked_fill(mask == 0, -1e4)
+
+        att = F.softmax(logits, dim=-1)          # (B, Nq, K, E)
+
+        V_e = V_e.unsqueeze(2)                   # (B, Nq, 1, E, Ck)
+        att = att.unsqueeze(-1)                  # (B, Nq, K, E, 1)
+
+        kp_edge_feat = (att * V_e).sum(dim=3)    # (B, Nq, K, Ck)
+        return kp_edge_feat
+
     def _predict_from(
         self,
         h: torch.Tensor,
@@ -414,68 +691,44 @@ class CuboidDetr(nn.Module):
         box_center_2d = boxes[..., :2]
         box_wh_2d = boxes[..., 2:]
 
+        # coarse kp
         kp_in_coarse = torch.cat([h, boxes], dim=-1)
         kp_logits_coarse = self.kp_coarse_head(kp_in_coarse)
         kp_rel_coarse = torch.tanh(
             kp_logits_coarse.view(B, Nq, self.num_kp, 2)
-        )
+        )  # [-1,1]
 
         pred_kp_coarse = (
             box_center_2d.unsqueeze(2)
             + 0.5 * kp_rel_coarse * box_wh_2d.unsqueeze(2)
+        )  # [0,1]
+
+        kp_point_feat, h_exp, box_exp = self._sample_kp_point_features(
+            h=h,
+            boxes=boxes,
+            kp_rel_coarse=kp_rel_coarse,
+            kp_feat_map=kp_feat_map,
         )
 
-        box_center = box_center_2d.unsqueeze(2).unsqueeze(3)
-        box_wh = box_wh_2d.unsqueeze(2).unsqueeze(3)
-
-        h_exp = h.detach().unsqueeze(2).expand(-1, -1, self.num_kp, -1)
-        box_exp = boxes.detach().unsqueeze(2).expand(-1, -1, self.num_kp, -1)
-        sample_in = torch.cat(
-            [h_exp, box_exp, kp_rel_coarse.detach()],
-            dim=-1,
+        edge_feat = self._sample_edge_features_raw(
+            kp_feat_map=kp_feat_map,
+            pred_kp_coarse=pred_kp_coarse,
+            h=h,
         )
 
-        num_samples = self.num_kp_samples
-
-        sample_in_flat = sample_in.view(B * Nq * self.num_kp, -1)
-        sample_offset_flat = self.kp_sample_offset_head(sample_in_flat)
-        sample_weight_flat = self.kp_sample_weight_head(sample_in_flat)
-
-        sample_offset = torch.tanh(
-            sample_offset_flat.view(B, Nq, self.num_kp, num_samples, 2)
-        ) * self.sample_offset_scale
-        sample_weight = sample_weight_flat.view(
-            B, Nq, self.num_kp, num_samples
-        )
-
-        kp_rel_sample = kp_rel_coarse.detach().unsqueeze(3) + sample_offset
-
-        sample_pos = box_center + 0.5 * kp_rel_sample * box_wh
-
-        grid = sample_pos * 2.0 - 1.0
-        grid = grid.view(B, Nq * self.num_kp, num_samples, 2)
-
-        sampled_multi = F.grid_sample(
-            kp_feat_map, grid, align_corners=False
-        )
-
-        C = self.kp_feat_dim
-        sampled_multi = sampled_multi.view(
-            B, C, Nq, self.num_kp, num_samples
-        ).permute(0, 2, 3, 4, 1)
-
-        att = F.softmax(sample_weight, dim=-1)
-        sampled_flat = sampled_multi.reshape(
-            B * Nq * self.num_kp, num_samples, C
-        )
-        att_flat = att.reshape(B * Nq * self.num_kp, num_samples, 1)
-        sampled_agg = (att_flat * sampled_flat).sum(dim=1)
-        sampled = sampled_agg.view(
-            B, Nq, self.num_kp, C
+        kp_edge_feat = self._aggregate_edge_features(
+            edge_feat=edge_feat,
+            kp_point_feat=kp_point_feat,
         )
 
         refine_in = torch.cat(
-            [h_exp, box_exp, kp_rel_coarse.detach(), sampled],
+            [
+                h_exp,                      # (B,Nq,K,Cq)
+                box_exp,                    # (B,Nq,K,4)
+                kp_rel_coarse.detach(),     # (B,Nq,K,2)
+                kp_point_feat,              # (B,Nq,K,Ck)
+                kp_edge_feat,               # (B,Nq,K,Ck)
+            ],
             dim=-1,
         )
 

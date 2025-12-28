@@ -48,7 +48,7 @@ class ImageFolderDataset(Dataset):
         paths: List[str],
         img_max_size: int = 1333,
         img_min_size: int = 480,
-        size_multiple: int = 32,
+        output_size: int = 532,
         normalize: bool = False,
         mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
         std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
@@ -56,7 +56,7 @@ class ImageFolderDataset(Dataset):
         self.paths = paths
         self.img_max = img_max_size
         self.img_min = img_min_size
-        self.size_multiple = size_multiple
+        self.output_size = output_size
         self.normalize = normalize
         self.mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
@@ -71,9 +71,7 @@ class ImageFolderDataset(Dataset):
         else:
             scale = min(1.0, self.img_max / max(h, w))
 
-        new_w, new_h = int(round(w * scale)), int(round(h * scale))
-        new_w = max(self.size_multiple, int(np.floor(new_w / self.size_multiple)) * self.size_multiple)
-        new_h = max(self.size_multiple, int(np.floor(new_h / self.size_multiple)) * self.size_multiple)
+        new_w, new_h = self.output_size, self.output_size
         resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         return resized
 
@@ -233,8 +231,21 @@ def draw_predictions(
 
         if kps_xy is not None:
             pts = kps_xy[i].astype(int)
-            for p in pts:
-                cv2.circle(out, (p[0], p[1]), kp_radius, (0, 0, 255), -1)
+            for j, p in enumerate(pts):
+                x, y = int(p[0]), int(p[1])
+                cv2.circle(out, (x, y), kp_radius, (0, 0, 255), -1)
+                # Slight offset so text does not overlap the circle
+                cv2.putText(
+                    out,
+                    str(j),
+                    (x + 3, y - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (0, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+
             if pts.shape[0] >= 8:
                 for (a, b) in CUBOID_EDGES:
                     pa, pb = pts[a], pts[b]
@@ -495,6 +506,7 @@ def main():
     parser.add_argument("--images", type=str, default=None, help="Image path or directory")
     parser.add_argument("--img_min_size", type=int, default=480)
     parser.add_argument("--img_max_size", type=int, default=1333)
+    parser.add_argument("--output_size", type=int, default=532)
     parser.add_argument("--normalize", action="store_true", help="Apply ImageNet mean/std normalization")
     parser.add_argument("--h5_root", type=str, default=None, help="H5 dataset root for CuboidDataset")
     parser.add_argument("--batch_size", type=int, default=4)
@@ -535,7 +547,6 @@ def main():
     if args.vis_attn:
         enable_last_decoder_attn_record(model, flag=True)
 
-    size_multiple = margs.patch_size * margs.num_windows
     from_h5 = False
 
     if args.images is not None:
@@ -547,7 +558,7 @@ def main():
             img_max_size=args.img_max_size,
             img_min_size=args.img_min_size,
             normalize=args.normalize,
-            size_multiple=size_multiple,
+            output_size=args.output_size,
         )
         loader = DataLoader(
             ds,
@@ -560,7 +571,7 @@ def main():
         os.makedirs(args.out_dir, exist_ok=True)
     else:
         from_h5 = True
-        ds = CuboidDataset(root_dir=args.h5_root, size_multiple=size_multiple, filter="bbox_center")
+        ds = CuboidDataset(root_dir=args.h5_root, output_size=532, object_filter="bbox_center")
         loader = DataLoader(
             ds,
             batch_size=args.batch_size,

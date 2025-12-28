@@ -6,36 +6,7 @@
 
 import torch
 
-# ---------- topology ----------
-# 0: back-bottom-left
-# 1: back-bottom-right
-# 2: back-top-right
-# 3: back-top-left
-# 4: front-bottom-left
-# 5: front-bottom-right
-# 6: front-top-right
-# 7: front-top-left
-
-EDGES = torch.tensor([
-    [0,1],[1,2],[2,3],[3,0],   # back face
-    [4,5],[5,6],[6,7],[7,4],   # front face
-    [0,4],[1,5],[2,6],[3,7],   # depth edges
-], dtype=torch.long)
-
-PARALLEL_GROUPS = [
-    torch.tensor([[0,1],[3,2],[4,5],[7,6]], dtype=torch.long),  # x-like (left→right)
-    torch.tensor([[0,3],[1,2],[4,7],[5,6]], dtype=torch.long),  # y-like (bottom→top)
-    torch.tensor([[0,4],[1,5],[2,6],[3,7]], dtype=torch.long),  # z-like (back→front)
-]
-
-FACES = torch.tensor([
-    [0,3,2,1],  # back
-    [4,5,6,7],  # front
-    [0,4,7,3],  # left
-    [1,2,6,5],  # right
-    [0,1,5,4],  # bottom
-    [3,7,6,2],  # top
-], dtype=torch.long)
+from cbdetr.util.cuboid_topology import EDGES, FACES
 
 # ---------- utils ----------
 def bbox_from_kp(kp):
@@ -166,10 +137,6 @@ def loss_repulsion(pred_kp, gt_kp, tau_ratio=0.5, eps=1e-6):
 
 # ---------- master aggregation ----------
 def cuboid_kp_losses(outputs, targets, kp_match_results,
-                     lambda_kp=4.0, lambda_bbox_kp=1.0,
-                     lambda_edge=0.5,
-                     lambda_face=0.3, lambda_rep=0.05,
-                     lambda_kp_coarse=1.0, lambda_edge_coarse=0.2,
                      use_huber=True,
                      coord_scale=1.0):
 
@@ -243,13 +210,4 @@ def cuboid_kp_losses(outputs, targets, kp_match_results,
         "loss_edge_coarse": _cat_mean(loss_edge_coarse),
     }
 
-    total = (lambda_kp      * losses["loss_kp"]
-           + lambda_bbox_kp * losses["loss_bbox_kp"]
-           + lambda_edge    * losses["loss_edge"]
-           + lambda_face    * losses["loss_face"]
-           + lambda_rep     * losses["loss_rep"]
-           + lambda_kp_coarse * losses["loss_kp_coarse"]
-           + lambda_edge_coarse * losses["loss_edge_coarse"])
-
-    losses["loss_kp_total"] = total
     return losses

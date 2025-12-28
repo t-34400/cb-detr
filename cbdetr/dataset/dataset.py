@@ -130,6 +130,15 @@ class CuboidDataset(Dataset):
     # low-level helpers
     # ---------------------------------------------------------------------
 
+    def _resize_image(
+        self, img_chw: torch.Tensor, target_hw: Tuple[int, int]
+    ) -> torch.Tensor:
+        img_bchw = img_chw.unsqueeze(0)
+        mode = self.resize_interp
+        align_corners = False if mode in ("bilinear", "bicubic") else None
+        out = F.interpolate(img_bchw, size=target_hw, mode=mode, align_corners=align_corners)
+        return out.squeeze(0)
+
     def _read_object_array(self, dset, start: int, end: int) -> List[np.ndarray]:
         slice_obj = dset[start:end]
         out: List[np.ndarray] = []
@@ -635,15 +644,6 @@ class CuboidDataset(Dataset):
     # ---------------------------------------------------------------------
     # augmentation (photometry)
     # ---------------------------------------------------------------------
-
-    def _resize_image(
-        self, img_chw: torch.Tensor, target_hw: Tuple[int, int]
-    ) -> torch.Tensor:
-        img_bchw = img_chw.unsqueeze(0)
-        mode = self.resize_interp
-        align_corners = False if mode in ("bilinear", "bicubic") else None
-        out = F.interpolate(img_bchw, size=target_hw, mode=mode, align_corners=align_corners)
-        return out.squeeze(0)
 
     def _degrade_resolution(self, img: torch.Tensor) -> torch.Tensor:
         if not self.augment:
